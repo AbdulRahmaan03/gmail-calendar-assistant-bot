@@ -4,6 +4,10 @@ The LLM can only *propose* an action (send, reply, create, delete). A proposal
 is validated, stored here, and shown to the user with a preview built from the
 stored parameters -- never from the model's own text. Nothing runs until the
 same user taps Confirm, and a proposal can be confirmed at most once.
+
+Previews are never truncated: if one would not fit in a Telegram message, the
+proposal is rejected and the model is asked to shorten it. What the user reads
+is exactly what gets executed.
 """
 
 from __future__ import annotations
@@ -22,6 +26,9 @@ EMAIL_SEND = "email_send"
 EMAIL_REPLY = "email_reply"
 CALENDAR_CREATE = "calendar_create"
 CALENDAR_DELETE = "calendar_delete"
+
+# Telegram allows 4096 characters; leave room for the footer / status line.
+PREVIEW_LIMIT = 3_800
 
 _BUTTON_LABELS = {
     EMAIL_SEND: "✅ Send email",
@@ -58,6 +65,9 @@ def _purge_expired_locked() -> None:
 
 
 def _store(user_id: int, kind: str, params: dict[str, Any], preview: str) -> PendingAction:
+    if len(preview) > PREVIEW_LIMIT:
+        raise ValueError(f"The confirmation preview would be {len(preview)} characters, more than Telegram can "
+                         f"show in one message ({PREVIEW_LIMIT}). Shorten the text and try again.")
     action = PendingAction(id=secrets.token_urlsafe(9), user_id=user_id, kind=kind, params=params, preview=preview)
     with _lock:
         _purge_expired_locked()
@@ -75,13 +85,12 @@ def take(action_id: str, user_id: int) -> PendingAction | None:
         return _pending.pop(action_id)
 
 
-def count() -> int:
-    with _lock:
-        _purge_expired_locked()
-        return len(_pending)
-
-
 def _fmt_time(value: str) -> str:
+    if len(value) == 10:  # all-day events carry a date only
+        try:
+            return datetime.date.fromisoformat(value).strftime("%a %d %b %Y (all day)")
+        except ValueError:
+            return value
     try:
         parsed = datetime.datetime.fromisoformat(value)
     except ValueError:
@@ -89,6 +98,10 @@ def _fmt_time(value: str) -> str:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(config.TZ)
     return parsed.strftime("%a %d %b %Y, %H:%M")
+
+
+def _shorten(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 # ==================== PROPOSALS (validated, nothing executed) ====================
@@ -111,41 +124,35 @@ def propose_email_send(user_id: int, to: Any, subject: Any, body: Any) -> Pendin
 
 
 def propose_email_reply(user_id: int, message_id: Any, body: Any) -> PendingAction:
-    message_id = gs.validate_id(message_id, "message ID")
     body = gs.validate_body(body)
-    # Look the original up so the preview shows who really receives the reply.
-    original = gs.get_email_details(message_id)
-    sender = original["sender_email"] or original["sender_name"]
-    subject = gs.unwrap_untrusted(original["subject"]) or "(No Subject)"
-    params = {"message_id": message_id, "body": body}
-    preview = (
-        "↩️ Send this reply?\n\n"
-        f"Replying to: {sender}\n"
-        f"Original subject: {subject}\n"
-        "──────────\n"
-        f"{body}"
-    )
-    return _store(user_id, EMAIL_REPLY, params, preview)
+    # Resolve the real recipients now and pin them: the reply is sent to exactly these.
+    ctx = gs.get_reply_context(message_id)
+    params = {
+        "message_id": ctx["message_id"],
+        "recipients": ctx["recipients"],
+        "subject": ctx["subject"],
+        "body": body,
+    }
+    lines = [
+        "↩️ Send this reply?\n",
+        f"To: {', '.join(ctx['recipients'])}",
+        f"Subject: {_shorten(ctx['subject'], 200)}",
+    ]
+    if ctx["reply_to_differs"]:
+        lines.append(f"⚠️ This email was sent from {ctx['from'] or 'another address'} but asks for replies to go "
+                     "to the address above. Make sure you trust it.")
+    if ctx["sent_by_me"]:
+        lines.append("(This is your own message, so the reply goes to its original recipients.)")
+    lines += ["──────────", body]
+    return _store(user_id, EMAIL_REPLY, params, "\n".join(lines))
 
 
 def propose_calendar_create(user_id: int, summary: Any, start_iso: Any, end_iso: Any,
                             description: Any = "", location: Any = "") -> PendingAction:
-    summary = " ".join(str(summary or "").split())[:250]
-    if not summary:
-        raise ValueError("Event title must not be empty.")
-    start, end = gs.parse_event_time(start_iso), gs.parse_event_time(end_iso)
-    if end <= start:
-        raise ValueError("Event end time must be after its start time.")
-    params = {
-        "summary": summary,
-        "start_iso": start.isoformat(),
-        "end_iso": end.isoformat(),
-        "description": str(description or "")[: gs.MAX_EVENT_TEXT_LEN],
-        "location": str(location or "")[:500],
-    }
+    params = gs.validate_event(summary, start_iso, end_iso, description, location)
     lines = [
         "📅 Create this event?\n",
-        f"Title: {summary}",
+        f"Title: {params['summary']}",
         f"Starts: {_fmt_time(params['start_iso'])}",
         f"Ends: {_fmt_time(params['end_iso'])}",
     ]
@@ -162,7 +169,7 @@ def propose_calendar_delete(user_id: int, event: dict[str, Any]) -> PendingActio
         "recurring_event_id": event.get("recurring_event_id") or "",
         "original_start": event.get("original_start") or "",
     }
-    title = gs.unwrap_untrusted(event.get("summary")) or "No Title"
+    title = _shorten(gs.unwrap_untrusted(event.get("summary")) or "No Title", 250)
     lines = [
         "🗑 Delete this event?\n",
         f"Title: {title}",
@@ -171,6 +178,9 @@ def propose_calendar_delete(user_id: int, event: dict[str, Any]) -> PendingActio
     ]
     if params["recurring_event_id"]:
         lines.append("(Only this occurrence of the recurring event will be deleted.)")
+    guests = int(event.get("guest_count") or 0)
+    if guests:
+        lines.append(f"This event has {guests} other guest(s). They will not be notified.")
     return _store(user_id, CALENDAR_DELETE, params, "\n".join(lines))
 
 
@@ -184,8 +194,8 @@ def execute(action: PendingAction) -> str:
         gs.send_email(p["to"], p["subject"], p["body"])
         return f"Email sent to {p['to']}."
     if action.kind == EMAIL_REPLY:
-        gs.reply_email(p["message_id"], p["body"])
-        return "Reply sent."
+        gs.send_reply(p["message_id"], p["recipients"], p["subject"], p["body"])
+        return f"Reply sent to {', '.join(p['recipients'])}."
     if action.kind == CALENDAR_CREATE:
         gs.create_calendar_event(p["summary"], p["start_iso"], p["end_iso"], p["description"], p["location"])
         return f"Event created: {p['summary']}."

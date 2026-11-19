@@ -36,6 +36,12 @@ def test_config_rejects_bad_values():
         assert text in proc.stderr
 
 
+def test_malformed_log_record_does_not_raise_or_leak():
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "token %s %s", ("bot123456789:" + "y" * 35,), None)
+    assert logging_setup.RedactSecretsFilter().filter(record) is True
+    assert "y" * 35 not in str(record.args)
+
+
 def test_log_redaction_hides_bot_token_and_keys():
     record = logging.LogRecord("httpx", logging.INFO, __file__, 1,
                                "POST https://api.telegram.org/bot%s/getUpdates key=%s",

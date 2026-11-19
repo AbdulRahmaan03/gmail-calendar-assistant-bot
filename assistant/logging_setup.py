@@ -27,7 +27,13 @@ class RedactSecretsFilter(logging.Filter):
     """Scrub tokens and API keys from every record before it is written."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
+        try:
+            message = record.getMessage()
+        except Exception:  # malformed record (bad %-args): scrub the parts, let the handler report it
+            record.msg = redact(str(record.msg))
+            if isinstance(record.args, tuple):
+                record.args = tuple(redact(str(a)) for a in record.args)
+            return True
         cleaned = redact(message)
         if cleaned != message:
             record.msg, record.args = cleaned, None

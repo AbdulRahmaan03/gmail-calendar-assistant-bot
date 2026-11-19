@@ -10,10 +10,10 @@ from . import logging_setup
 
 logging_setup.configure()
 
-# Imported after logging is configured so configuration errors land in bot.log.
+# Imported after logging is configured so configuration errors land in runtime/bot.log.
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update  # noqa: E402
 from telegram.constants import ChatAction, ChatType  # noqa: E402
-from telegram.error import Conflict  # noqa: E402
+from telegram.error import BadRequest, Conflict  # noqa: E402
 from telegram.ext import (  # noqa: E402
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -50,6 +50,11 @@ def is_authorized(update: Update) -> bool:
     return ok
 
 
+def _fit(text: str, limit: int = TELEGRAM_LIMIT) -> str:
+    """Defensive cap; previews are already limited in actions.py, so this should never cut."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _chunks(text: str, size: int = TELEGRAM_LIMIT) -> list[str]:
     text = text or "(empty response)"
     parts = []
@@ -68,7 +73,7 @@ async def send_safe_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
         try:
             await context.bot.send_message(chat_id=chat_id, text=part, parse_mode="Markdown",
                                            link_preview_options=NO_PREVIEW)
-        except Exception as exc:
+        except BadRequest as exc:  # Telegram couldn't parse the Markdown; other errors propagate
             logger.info("Markdown send failed (%s); sending plain text.", exc)
             await context.bot.send_message(chat_id=chat_id, text=part, link_preview_options=NO_PREVIEW)
 
@@ -80,10 +85,7 @@ async def send_confirmation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ac
         InlineKeyboardButton("❌ Cancel", callback_data=f"no:{action.id}"),
     ]])
     footer = f"\n\nExpires in {config.ACTION_TTL_MINUTES} min. Nothing happens until you tap a button."
-    preview = action.preview
-    if len(preview) + len(footer) > TELEGRAM_LIMIT:
-        preview = preview[: TELEGRAM_LIMIT - len(footer) - 30] + "\n…(truncated preview)"
-    await context.bot.send_message(chat_id=chat_id, text=preview + footer, reply_markup=keyboard,
+    await context.bot.send_message(chat_id=chat_id, text=_fit(action.preview + footer), reply_markup=keyboard,
                                    link_preview_options=NO_PREVIEW)
 
 
@@ -200,10 +202,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if verb == "no":
-        await query.edit_message_text(f"{action.preview}\n\n❌ Cancelled. Nothing was done.")
+        await query.edit_message_text(_fit(f"{action.preview}\n\n❌ Cancelled. Nothing was done."))
         return
 
-    await query.edit_message_text(f"{action.preview}\n\n⏳ Working on it…")
+    await query.edit_message_text(_fit(f"{action.preview}\n\n⏳ Working on it…"))
     try:
         result = await asyncio.to_thread(actions.execute, action)
         status = f"✅ {result}"
@@ -213,7 +215,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         logger.exception("Confirmed %s crashed", action.kind)
         status = "❌ Failed due to an internal error. Details are in runtime/bot.log."
-    await query.edit_message_text(f"{action.preview}\n\n{status}")
+    await query.edit_message_text(_fit(f"{action.preview}\n\n{status}"))
 
 
 # ==================== SCHEDULED BRIEFING ====================
@@ -263,7 +265,8 @@ def main() -> None:
         app.add_handler(CommandHandler("reset", reset_command))
         app.add_handler(CommandHandler("briefing", briefing_command))
         app.add_handler(CallbackQueryHandler(handle_callback))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        # New messages only: editing an old message must not re-run the request.
+        app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, handle_message))
         app.add_error_handler(on_error)
 
         if app.job_queue is None:

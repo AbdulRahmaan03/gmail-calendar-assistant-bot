@@ -5,6 +5,7 @@ Safety measures applied to every call:
   * `--enable-commands=<exact command>` so gog itself refuses anything else
   * `--readonly` on every read
   * `--` before positional values so they can never be parsed as flags
+  * email bodies go through stdin, not the command line
   * a timeout, so a hung gog process cannot freeze the bot
   * `--wrap-untrusted` on reads, so email and invite text arrives marked as
     third-party content for the LLM
@@ -31,8 +32,13 @@ MAX_EMAIL_RESULTS = 20
 MAX_CALENDAR_DAYS = 31
 DELETE_SEARCH_DAYS = 60
 MAX_SUBJECT_LEN = 250
-MAX_BODY_LEN = 10_000
-MAX_EVENT_TEXT_LEN = 2_000
+MAX_REPLY_SUBJECT_LEN = 900  # "Re: <original>" can be long; it must not be cut or threading breaks
+MAX_BODY_LEN = 3_000  # keeps the full text visible in one Telegram confirmation message
+MAX_REPLY_RECIPIENTS = 5
+MAX_EVENT_TITLE_LEN = 250
+MAX_EVENT_TEXT_LEN = 1_500
+MAX_EVENT_LOCATION_LEN = 300
+MAX_EVENT_DURATION = datetime.timedelta(days=14)
 EMAIL_PREVIEW_CHARS = 1_500
 
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,1023}")  # must not start with "-"
@@ -66,12 +72,12 @@ def validate_email_address(value: Any) -> str:
     return value
 
 
-def validate_subject(value: Any) -> str:
+def validate_subject(value: Any, max_len: int = MAX_SUBJECT_LEN) -> str:
     value = " ".join(str(value or "").split())  # no newlines: prevents header tricks
     if not value:
         raise ValueError("Email subject must not be empty.")
-    if len(value) > MAX_SUBJECT_LEN:
-        raise ValueError(f"Email subject is longer than {MAX_SUBJECT_LEN} characters.")
+    if len(value) > max_len:
+        raise ValueError(f"Email subject is longer than {max_len} characters.")
     return value
 
 
@@ -80,14 +86,14 @@ def validate_body(value: Any) -> str:
     if not value:
         raise ValueError("Message body must not be empty.")
     if len(value) > MAX_BODY_LEN:
-        raise ValueError(f"Message body is longer than {MAX_BODY_LEN} characters.")
+        raise ValueError(f"Message body is {len(value)} characters; the limit is {MAX_BODY_LEN}. Shorten it.")
     return value
 
 
-def _clean_text(value: Any, limit: int) -> str:
+def _clean_text(value: Any, limit: int, what: str) -> str:
     value = _CONTROL_CHARS_RE.sub("", str(value or "")).strip()
     if len(value) > limit:
-        raise ValueError(f"Text is longer than {limit} characters.")
+        raise ValueError(f"{what} is longer than {limit} characters.")
     return value
 
 
@@ -101,6 +107,27 @@ def parse_event_time(value: Any) -> datetime.datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=config.TZ)
     return parsed
+
+
+def validate_event(summary: Any, start_iso: Any, end_iso: Any, description: Any = "",
+                   location: Any = "") -> dict[str, str]:
+    """Validate and normalise event fields. Used both for the preview and for creation,
+    so what the user confirms is exactly what gets created."""
+    summary = " ".join(_clean_text(summary, MAX_EVENT_TITLE_LEN, "Event title").split())
+    if not summary:
+        raise ValueError("Event title must not be empty.")
+    start, end = parse_event_time(start_iso), parse_event_time(end_iso)
+    if end <= start:
+        raise ValueError("Event end time must be after its start time.")
+    if end - start > MAX_EVENT_DURATION:
+        raise ValueError("Events longer than 14 days are not supported.")
+    return {
+        "summary": summary,
+        "start_iso": start.isoformat(),
+        "end_iso": end.isoformat(),
+        "description": _clean_text(description, MAX_EVENT_TEXT_LEN, "Event notes"),
+        "location": " ".join(_clean_text(location, MAX_EVENT_LOCATION_LEN, "Event location").split()),
+    }
 
 
 def clamp(value: Any, low: int, high: int, default: int) -> int:
@@ -150,6 +177,19 @@ def parse_sender(raw_from: Any) -> dict[str, str]:
     return {"name": name, "email": addr, "formatted": formatted}
 
 
+def _addresses(header: Any) -> list[str]:
+    """Valid, de-duplicated addresses from an address-list header."""
+    found: list[str] = []
+    for _name, addr in email.utils.getaddresses([unwrap_untrusted(header)]):
+        try:
+            addr = validate_email_address(addr)
+        except ValueError:
+            continue
+        if addr.lower() not in (a.lower() for a in found):
+            found.append(addr)
+    return found
+
+
 def _clean_html_text(text: str) -> str:
     """Strip HTML tags, styles and scripts; collapse whitespace."""
     if not text:
@@ -163,7 +203,7 @@ def _clean_html_text(text: str) -> str:
 
 
 def _run_gog(command: list[str], flags: list[str] | None = None, positional: list[str] | None = None,
-             *, readonly: bool) -> dict[str, Any]:
+             *, readonly: bool, stdin_text: str | None = None) -> dict[str, Any]:
     args = ["gog", *command, "--json", "--no-input", f"--enable-commands={'.'.join(command)}"]
     if readonly:
         args.append("--readonly")
@@ -172,34 +212,36 @@ def _run_gog(command: list[str], flags: list[str] | None = None, positional: lis
         args.append("--")
         args.extend(positional)
 
+    # Bytes in and out: no newline translation of bodies, explicit UTF-8.
+    io_kwargs: dict[str, Any] = (
+        {"input": stdin_text.encode("utf-8")} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
+    )
     try:
         proc = subprocess.run(
             args,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdin=subprocess.DEVNULL,
             timeout=config.GOG_TIMEOUT_SECONDS,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
             check=False,
+            **io_kwargs,
         )
     except FileNotFoundError as exc:
         raise GogError("The gog CLI is not installed or not on PATH.") from exc
     except subprocess.TimeoutExpired as exc:
         raise GogError(f"gog {' '.join(command)} timed out after {config.GOG_TIMEOUT_SECONDS}s.") from exc
 
+    stdout = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = (stderr or stdout).splitlines()
         message = detail[0][:300] if detail else f"exit code {proc.returncode}"
         log.warning("gog %s failed (exit %s): %s", " ".join(command), proc.returncode, message)
         raise GogError(f"gog {' '.join(command)} failed: {message}")
 
-    output = proc.stdout.strip()
-    if not output:
+    if not stdout:
         return {}
     try:
-        data = json.loads(output)
+        data = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise GogError(f"gog {' '.join(command)} returned non-JSON output.") from exc
     return data if isinstance(data, dict) else {"data": data}
@@ -216,6 +258,8 @@ def _event_time(value: Any) -> str:
 
 def _normalise_event(e: dict[str, Any]) -> dict[str, Any]:
     original = e.get("originalStartTime")
+    attendees = e.get("attendees") if isinstance(e.get("attendees"), list) else []
+    guests = [a for a in attendees if isinstance(a, dict) and not a.get("self") and not a.get("resource")]
     return {
         "id": e.get("id"),
         "summary": e.get("summary") or "No Title",
@@ -225,20 +269,16 @@ def _normalise_event(e: dict[str, Any]) -> dict[str, Any]:
         "description": str(e.get("description") or "")[:500],
         "recurring_event_id": e.get("recurringEventId") or "",
         "original_start": _event_time(original) if original else "",
+        "guest_count": len(guests),
     }
 
 
-def list_calendar_events(days: Any = 0, query: Any = None) -> list[dict[str, Any]]:
-    """Events from the start of today through `days` days ahead (0 = today only)."""
-    days = clamp(days, 0, MAX_CALENDAR_DAYS, 0)
+def _fetch_events(days: int, query: Any = None) -> list[dict[str, Any]]:
+    """Events from the start of today (local time) through `days` days ahead.
+    gog expands recurring events into individual occurrences."""
     start = config.now().replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + datetime.timedelta(days=days + 1)
-    flags = [
-        f"--from={start.isoformat()}",
-        f"--to={end.isoformat()}",
-        "--max=250",
-        "--wrap-untrusted",
-    ]
+    flags = [f"--from={start.isoformat()}", f"--to={end.isoformat()}", "--max=250", "--wrap-untrusted"]
     query = str(query or "").strip()
     if query:
         flags.append(f"--query={query[:200]}")
@@ -246,50 +286,59 @@ def list_calendar_events(days: Any = 0, query: Any = None) -> list[dict[str, Any
     return [_normalise_event(e) for e in data.get("events") or [] if isinstance(e, dict)]
 
 
-def find_events_for_deletion(identifier: Any) -> list[dict[str, Any]]:
-    """Upcoming events whose ID equals, or whose title contains, `identifier`."""
+def list_calendar_events(days: Any = 0, query: Any = None) -> list[dict[str, Any]]:
+    """Events from today through `days` days ahead (0 = today only, max 31)."""
+    return _fetch_events(clamp(days, 0, MAX_CALENDAR_DAYS, 0), query)
+
+
+def find_events_for_deletion(identifier: Any, on_date: Any = None) -> list[dict[str, Any]]:
+    """Events in the next 60 days whose ID equals, or whose title contains, `identifier`,
+    optionally limited to events starting on `on_date` (YYYY-MM-DD, local time)."""
     needle = str(identifier or "").strip()
     if not needle:
         raise ValueError("Tell me which event to delete.")
-    events = list_calendar_events(days=DELETE_SEARCH_DAYS)
-    exact = [e for e in events if e["id"] == needle]
-    if exact:
-        return exact
-    lowered = needle.lower()
-    return [e for e in events if lowered in unwrap_untrusted(e["summary"]).lower()]
+    day: datetime.date | None = None
+    if on_date:
+        try:
+            day = datetime.date.fromisoformat(str(on_date).strip()[:10])
+        except ValueError as exc:
+            raise ValueError(f"Invalid date {str(on_date)[:20]!r}; use YYYY-MM-DD.") from exc
+
+    events = _fetch_events(DELETE_SEARCH_DAYS)
+    matches = [e for e in events if e["id"] == needle]
+    if not matches:
+        lowered = needle.lower()
+        matches = [e for e in events if lowered in unwrap_untrusted(e["summary"]).lower()]
+    if day is not None:
+        matches = [e for e in matches if _local_date(e["start"]) == day]
+    return matches
+
+
+def _local_date(value: str) -> datetime.date | None:
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(config.TZ)
+    return parsed.date()
 
 
 def create_calendar_event(summary: Any, start_iso: Any, end_iso: Any, description: Any = "",
                           location: Any = "") -> dict[str, Any]:
-    summary = " ".join(_clean_text(summary, 250).split())
-    if not summary:
-        raise ValueError("Event title must not be empty.")
-    start, end = parse_event_time(start_iso), parse_event_time(end_iso)
-    if end <= start:
-        raise ValueError("Event end time must be after its start time.")
-    if end - start > datetime.timedelta(days=14):
-        raise ValueError("Events longer than 14 days are not supported.")
-
-    flags = [f"--summary={summary}", f"--from={start.isoformat()}", f"--to={end.isoformat()}"]
-    description = _clean_text(description, MAX_EVENT_TEXT_LEN)
-    location = _clean_text(location, 500)
-    if description:
-        flags.append(f"--description={description}")
-    if location:
-        flags.append(f"--location={location}")
-
+    p = validate_event(summary, start_iso, end_iso, description, location)
+    flags = [f"--summary={p['summary']}", f"--from={p['start_iso']}", f"--to={p['end_iso']}"]
+    if p["description"]:
+        flags.append(f"--description={p['description']}")
+    if p["location"]:
+        flags.append(f"--location={p['location']}")
     data = _run_gog(["calendar", "create"], flags, ["primary"], readonly=False)
     event = data.get("event") or {}
-    return {
-        "event_id": event.get("id"),
-        "summary": event.get("summary") or summary,
-        "start": _event_time(event.get("start")) or start.isoformat(),
-        "end": _event_time(event.get("end")) or end.isoformat(),
-    }
+    return {"event_id": event.get("id"), "summary": event.get("summary") or p["summary"]}
 
 
 def delete_calendar_event(event_id: Any, recurring_event_id: str = "", original_start: str = "") -> dict[str, Any]:
-    """Delete one event. For an instance of a recurring series, only that occurrence."""
+    """Delete one event. For an occurrence of a recurring series, only that occurrence."""
     event_id = validate_id(event_id, "event ID")
     flags = ["--force"]  # gog's own prompt is replaced by the Telegram confirmation
     if recurring_event_id and original_start:
@@ -302,39 +351,45 @@ def delete_calendar_event(event_id: Any, recurring_event_id: str = "", original_
 
 
 def search_emails(query: Any = "is:unread", limit: Any = 5) -> list[dict[str, Any]]:
+    """Search individual messages (not threads), so every ID is a real message ID."""
     query = str(query or "is:unread").strip()[:500]
     limit = clamp(limit, 1, MAX_EMAIL_RESULTS, 5)
-    data = _run_gog(["gmail", "search"], [f"--max={limit}", "--wrap-untrusted"], [query], readonly=True)
+    data = _run_gog(["gmail", "messages", "search"], [f"--max={limit}", "--wrap-untrusted"], [query],
+                    readonly=True)
     results = []
-    for t in data.get("threads") or []:
-        if not isinstance(t, dict):
+    for m in data.get("messages") or []:
+        if not isinstance(m, dict):
             continue
-        sender = parse_sender(t.get("from"))
+        sender = parse_sender(m.get("from"))
         results.append({
-            "id": t.get("id"),
+            "id": m.get("id"),
+            "thread_id": m.get("threadId"),
             "from": sender["formatted"],
             "sender_name": sender["name"],
             "sender_email": sender["email"],
-            "subject": t.get("subject") or "(No Subject)",
-            "date": t.get("date") or "",
-            "labels": t.get("labels") or [],
+            "subject": m.get("subject") or "(No Subject)",
+            "date": m.get("date") or "",
+            "labels": m.get("labels") or [],
         })
     return results
 
 
-def get_email_details(message_id: Any) -> dict[str, Any]:
-    message_id = validate_id(message_id, "message ID")
+def _get_message(message_id: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     data = _run_gog(["gmail", "get"], ["--wrap-untrusted"], [message_id], readonly=True)
-
     headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
     message = data.get("message") if isinstance(data.get("message"), dict) else {}
-    sender = parse_sender(headers.get("from"))
+    return data, headers, message
 
+
+def get_email_details(message_id: Any) -> dict[str, Any]:
+    message_id = validate_id(message_id, "message ID")
+    data, headers, message = _get_message(message_id)
+    sender = parse_sender(headers.get("from"))
     body = _clean_html_text(unwrap_untrusted(data.get("body")))[:EMAIL_PREVIEW_CHARS]
     snippet = message.get("snippet") or ""
-
     return {
         "id": message_id,
+        "thread_id": message.get("threadId"),
         "from": sender["formatted"],
         "sender_name": sender["name"],
         "sender_email": sender["email"],
@@ -346,13 +401,58 @@ def get_email_details(message_id: Any) -> dict[str, Any]:
     }
 
 
+def get_reply_context(message_id: Any) -> dict[str, Any]:
+    """Work out exactly who a reply goes to, using the standard rules (the same ones gog uses):
+    the Reply-To address if the email sets one, otherwise the sender; for your own sent
+    messages, the original recipients."""
+    message_id = validate_id(message_id, "message ID")
+    _data, headers, message = _get_message(message_id)
+    labels = message.get("labelIds") if isinstance(message.get("labelIds"), list) else []
+    from_addrs = _addresses(headers.get("from"))
+    reply_to_addrs = _addresses(headers.get("reply_to"))
+    sent_by_me = "SENT" in labels
+
+    recipients = _addresses(headers.get("to")) if sent_by_me else (reply_to_addrs or from_addrs)
+    if not recipients:
+        raise ValueError("Couldn't find a valid address to reply to in that email.")
+    if len(recipients) > MAX_REPLY_RECIPIENTS:
+        raise ValueError(f"That email would be replied to {len(recipients)} addresses; the limit is "
+                         f"{MAX_REPLY_RECIPIENTS}. Reply from Gmail instead.")
+
+    subject = " ".join(unwrap_untrusted(headers.get("subject")).split())
+    reply_subject = subject if subject.lower().startswith("re:") else (f"Re: {subject}" if subject else "Re:")
+    lowered = {a.lower() for a in from_addrs}
+    return {
+        "message_id": message_id,
+        "recipients": recipients,
+        "subject": reply_subject[:MAX_REPLY_SUBJECT_LEN],
+        "from": from_addrs[0] if from_addrs else "",
+        "reply_to_differs": bool(reply_to_addrs) and not sent_by_me
+        and {a.lower() for a in reply_to_addrs} != lowered,
+        "sent_by_me": sent_by_me,
+    }
+
+
 def send_email(to: Any, subject: Any, body: Any) -> dict[str, Any]:
     to, subject, body = validate_email_address(to), validate_subject(subject), validate_body(body)
-    _run_gog(["gmail", "send"], [f"--to={to}", f"--subject={subject}", f"--body={body}"], readonly=False)
+    _run_gog(["gmail", "send"], [f"--to={to}", f"--subject={subject}", "--body-file=-"],
+             readonly=False, stdin_text=body)
     return {"to": to}
 
 
-def reply_email(message_id: Any, body: Any) -> dict[str, Any]:
-    message_id, body = validate_id(message_id, "message ID"), validate_body(body)
-    _run_gog(["gmail", "reply"], [f"--body={body}"], [message_id], readonly=False)
-    return {"message_id": message_id}
+def send_reply(message_id: Any, recipients: list[str], subject: Any, body: Any) -> dict[str, Any]:
+    """Reply in the original thread to exactly `recipients` (as shown in the confirmation)."""
+    message_id = validate_id(message_id, "message ID")
+    recipients = [validate_email_address(r) for r in recipients]
+    if not 1 <= len(recipients) <= MAX_REPLY_RECIPIENTS:
+        raise ValueError("A reply needs between 1 and 5 recipients.")
+    subject = validate_subject(subject, MAX_REPLY_SUBJECT_LEN)
+    body = validate_body(body)
+    _run_gog(
+        ["gmail", "send"],
+        [f"--to={','.join(recipients)}", f"--subject={subject}", f"--reply-to-message-id={message_id}",
+         "--body-file=-"],
+        readonly=False,
+        stdin_text=body,
+    )
+    return {"message_id": message_id, "to": recipients}
