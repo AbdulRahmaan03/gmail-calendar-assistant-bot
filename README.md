@@ -1,34 +1,34 @@
 # 🤖 Executive Assistant Bot (Gmail & Google Calendar via Telegram)
 
-A lightweight, high-performance personal AI executive assistant that manages your **Google Calendar** and **Gmail** directly from your **Telegram** account.
+A lightweight personal AI assistant that manages your **Google Calendar** and **Gmail** from **Telegram**.
 
-Built with Python, `python-telegram-bot`, `gog-cli`, and powered by high-throughput function calling on **Groq** (`openai/gpt-oss-120b`).
+Built with Python, `python-telegram-bot`, [`gog`](https://github.com/steipete/gogcli) and tool calling on **Groq** (`openai/gpt-oss-120b`).
 
 ---
 
 ## ✨ Features
 
-- **⚡ Blazing Fast:** ~1.5 to 2.5 second turnaround time per request using Groq's low-latency LLM inference.
-- **🪶 Ultra Lightweight:** Consumes only ~35–50 MB of RAM (designed to run silently as a background service).
-- **🔒 Whitelist Security:** Strict user ID authentication ensures only authorized Telegram accounts can trigger bot actions.
-- **📅 Autonomous Calendar Management:**
-  - View schedule for today or upcoming days (*"What's on my schedule today?"*).
-  - Create events with natural language time parsing (*"Schedule team sync tomorrow from 2pm to 3pm"*).
-  - Delete events (*"Cancel my gym session today"*).
-  - Strictly lists verified events—never fabricates placeholder or filler blocks.
-- **📬 Smart Gmail Management:**
-  - Search and filter unread emails (*"Show emails from LinkedIn"*).
-  - Summarize email threads with clean mobile formatting.
-  - Senders hyperlinked directly to compose in Gmail (`[Sender](https://mail.google.com/mail/?view=cm&fs=1&to=...)`).
-  - **💼 Job Alert Aggregation:** Automatically groups high-volume job alert emails by platform (LinkedIn, Indeed, etc.) so your priority emails stay uncluttered.
-  - **🛡️ Safe Interactive Composing:** Preparing replies and sending new emails generates an interactive Telegram inline confirmation button (`[✅ Send Email]` / `[❌ Cancel]`) to prevent accidental dispatches.
-- **🌅 Executive Morning Briefing:**
-  - Automatically pushed every morning at **08:00 AM** (configurable to your timezone).
-  - Available on-demand anytime via `/briefing`.
-- **🔄 Fault-Tolerant & Boot Ready:**
-  - Single-instance locking to prevent duplicate process conflicts.
-  - Built-in 429 rate-limit backoff retry.
-  - Windows silent startup script (`start_silent.vbs`) for auto-boot.
+- **📅 Calendar:** view today or upcoming days, search events, create and delete events in natural language.
+- **📬 Gmail:** search and summarise email, draft new emails and replies.
+- **💼 Job-alert aggregation:** LinkedIn/Indeed-style alerts are grouped by platform so priority mail stands out.
+- **🌅 Morning briefing:** pushed daily at a configurable time, or on demand with `/briefing`.
+- **🪟 Windows friendly:** run in a console, silently in the background, or at login.
+
+## 🛡️ Safety guardrails
+
+| Guardrail | How it works |
+| :--- | :--- |
+| **Single authorised user** | `TELEGRAM_ALLOWED_USER_ID` is required. The bot refuses to start without it and only answers that user, in a private chat. |
+| **Confirm before any change** | Sending, replying, creating and deleting are only *proposed* by the AI. You get a preview built from the exact stored details (recipient, subject, body, event time) with Confirm/Cancel buttons. Proposals expire after 15 minutes and can be confirmed only once. |
+| **Prompt-injection defence** | Email and calendar text is marked as untrusted third-party content (gog `--wrap-untrusted`). The AI is told never to follow instructions inside it, and even if it did, nothing happens without your confirmation. The briefing has no tools at all. |
+| **Least-privilege CLI calls** | Each `gog` call is limited to the one command it needs (`--enable-commands`), reads run with `--readonly`, values are passed after `--` with no shell, and every call has a timeout. |
+| **Input validation** | Recipient addresses, IDs, subjects, bodies and event times are validated; result counts and date ranges are capped. |
+| **Secret hygiene** | Secrets live only in `.env` (git-ignored). Logs (`runtime/bot.log`) redact tokens and API keys, and rotate at 1 MB. |
+| **Single instance** | An OS file lock prevents two copies from running; `runtime/bot.pid` lets the scripts find the process. |
+
+### Privacy note
+
+To answer you, the bot sends the content of the emails and events it reads (subjects, senders, previews) and your messages to **Groq's API**. Don't use it with mail you aren't comfortable sharing with that provider. Conversation history is kept in memory only (last 8 exchanges, cleared on restart or with `/reset`).
 
 ---
 
@@ -36,105 +36,84 @@ Built with Python, `python-telegram-bot`, `gog-cli`, and powered by high-through
 
 ```mermaid
 flowchart LR
-    User["📱 User on Telegram<br/>(@YourBot)"] <-->|python-telegram-bot| Bot["🤖 bot.py<br/>(Telegram Gateway)"]
-    Bot <-->|Tool Calling| Agent["🧠 agent.py<br/>(Groq gpt-oss-120b)"]
-    Agent <-->|Direct CLI Subprocess| Google["⚡ google_service.py<br/>(gog CLI)"]
-    Google <-->|Authenticated API| GSuite["📅 Google Calendar<br/>& 📬 Gmail"]
+    User["📱 You on Telegram"] <-->|python-telegram-bot| Bot["🤖 assistant/bot.py<br/>auth, buttons, scheduler"]
+    Bot <--> Agent["🧠 agent.py<br/>Groq tool calling"]
+    Bot -->|on Confirm only| Actions["🛡️ actions.py<br/>pending actions"]
+    Agent -->|propose| Actions
+    Agent -->|read| Google["⚡ google_service.py<br/>gog CLI"]
+    Actions -->|execute| Google
+    Google <--> GSuite["📅 Calendar & 📬 Gmail"]
 ```
 
----
-
-## 📁 Repository Structure
+## 📁 Repository structure
 
 ```
 .
-├── .env.example          # Sample environment variables template
-├── .gitignore            # Git exclusion rules (protects credentials & logs)
-├── README.md             # Project documentation
-├── requirements.txt      # Python dependencies
-├── config.py             # Configuration loader & validation
-├── agent.py              # LLM agent, tool schemas & mobile prompt orchestration
-├── bot.py                # Telegram bot handlers & daily briefing scheduler
-├── google_service.py     # Clean wrapper for Google Calendar & Gmail operations
-├── run.bat               # Interactive launcher with duplicate-instance check
-├── status.bat            # One-click status checker
-├── stop_bot.bat          # Graceful bot shutdown script
-└── start_silent.vbs      # VBScript to run bot silently in background
+├── assistant/               # the bot (Python package, run with `python -m assistant`)
+│   ├── __main__.py          # entry point
+│   ├── bot.py               # Telegram handlers, authorisation, confirmations, daily briefing
+│   ├── agent.py             # LLM tool schemas, tool loop, system prompt, briefing
+│   ├── actions.py           # confirmation gate: validated pending actions + execution
+│   ├── google_service.py    # gog CLI wrapper (validation, timeouts, least privilege)
+│   ├── config.py            # loads and validates .env (fails closed)
+│   ├── logging_setup.py     # rotating log with secret redaction
+│   ├── instance_lock.py     # single-instance lock + PID file
+│   └── paths.py             # file locations
+├── scripts/windows/         # run.bat, start_silent.vbs, status.bat, stop_bot.bat
+├── tests/                   # pytest suite for the safety behaviour
+├── runtime/                 # created at run time: bot.log, bot.pid, bot.lock (git-ignored)
+├── .env.example
+├── pyproject.toml / requirements.txt / requirements-dev.txt
+└── README.md / LICENSE
 ```
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Getting started
 
 ### 1. Prerequisites
-- Python 3.11 or 3.12 installed.
-- [gog-cli](https://github.com/google/gogcli) installed and authenticated with your Google account:
-  ```bash
-  gog auth add your_email@gmail.com
-  ```
-- A Telegram Bot token from [@BotFather](https://t.me/BotFather).
-- A free API key from [Groq Console](https://console.groq.com/).
+- Python 3.11+.
+- [`gog`](https://github.com/steipete/gogcli) v0.48 or later, signed in to your Google account (`gog auth add you@gmail.com`).
+- A Telegram bot token from [@BotFather](https://t.me/BotFather) and your numeric user ID (e.g. from @userinfobot).
+- A Groq API key from the [Groq Console](https://console.groq.com/).
 
-### 2. Installation
-1. Clone the repository:
-   ```bash
-   git clone <your-repo-url>
-   cd <repo-folder>
-   ```
+### 2. Install
+```bash
+git clone https://github.com/AbdulRahmaan03/gmail-calendar-assistant-bot.git
+cd gmail-calendar-assistant-bot
+pip install -r requirements.txt
+copy .env.example .env
+```
+Then fill in `.env` (token, your user ID, Groq key, timezone, briefing time).
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 3. Run
+- **Console:** `python -m assistant` from the project folder, or double-click `scripts\windows\run.bat`.
+- **Background:** double-click `scripts\windows\start_silent.vbs`.
+- **At login:** `Win + R` → `shell:startup` → put a shortcut to `scripts\windows\start_silent.vbs` there.
+- **Status / stop:** `scripts\windows\status.bat` / `scripts\windows\stop_bot.bat`.
 
-3. Configure environment variables:
-   Copy `.env.example` to `.env`:
-   ```bash
-   copy .env.example .env
-   ```
-   Fill in your actual tokens and user ID in `.env`:
-   ```ini
-   TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
-   TELEGRAM_ALLOWED_USER_ID=your_numeric_telegram_user_id
-   GROQ_API_KEY=your_groq_api_key
-   GROQ_MODEL=openai/gpt-oss-120b
-   TIMEZONE=Asia/Dubai
-   BRIEFING_TIME=08:00
-   ```
+Logs are written to `runtime/bot.log`.
 
-### 3. Running the Bot
-
-- **To run in terminal:**
-  ```bash
-  python bot.py
-  ```
-  *or double-click `run.bat`.*
-
-- **To check status:**
-  Double-click `status.bat`.
-
-- **To run silently in the background:**
-  Double-click `start_silent.vbs`.
-
-- **To auto-start on Windows boot:**
-  Copy `start_silent.vbs` (or a shortcut to it) into your Windows Startup folder:
-  `Win + R` → `shell:startup` → paste shortcut.
+### 4. Develop
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
 
 ---
 
-## 💬 Usage Examples
+## 💬 Usage examples
 
-| Intent | Example Prompt to Bot |
+| Intent | Example |
 | :--- | :--- |
-| **Morning Briefing** | `/briefing` |
-| **Check Calendar** | *"What's on my schedule today?"* |
-| **Create Event** | *"Book Doctor Appointment tomorrow from 3pm to 4pm"* |
-| **Delete Event** | *"Cancel my haircut today"* |
-| **Check Emails** | *"Show my unread emails"* |
-| **Job Searches** | *"Check job alerts from LinkedIn"* |
-| **Draft / Reply** | *"Reply to John saying I received the proposal"* *(Bot asks for confirmation first)* |
-
----
+| Morning briefing | `/briefing` |
+| Check calendar | "What's on my schedule today?" |
+| Create event | "Book a doctor appointment tomorrow from 3pm to 4pm" → tap **Create event** |
+| Delete event | "Cancel my haircut today" → tap **Delete event** |
+| Check email | "Show my unread emails" |
+| Reply | "Reply to John saying I received the proposal" → review → tap **Send reply** |
+| Forget context | `/reset` |
 
 ## 📄 License
-MIT License
+[MIT](LICENSE)

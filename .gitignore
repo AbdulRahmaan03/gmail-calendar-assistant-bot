@@ -5,8 +5,9 @@
 client_secret*.json
 
 # Logs & Runtime State
+runtime/
 *.log
-bot.log
+*.log.*
 *.pid
 *.lock
 
@@ -15,6 +16,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+.ruff_cache/
 
 # Virtual Environments
 .venv/
