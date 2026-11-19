@@ -1,0 +1,29 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+client_secret*.json
+
+# Logs & Runtime State
+*.log
+bot.log
+*.pid
+*.lock
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Editor & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
